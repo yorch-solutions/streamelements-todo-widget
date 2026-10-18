@@ -2,12 +2,16 @@
   const TASKS_KEY = "todoTasks";
   const CONTROLS_KEY = "todoControlsVisible";
   const SETTINGS_KEY = "todoSettings";
-  const hasSE = typeof SE_API !== "undefined";
+  // SE_API is a global injected by StreamElements; the editor does not know about it.
+  // @ts-ignore
+  const seApi = typeof SE_API !== "undefined" ? SE_API : null;
+  const hasSE = seApi !== null;
   const HEX_RE = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i;
   const DEFAULT_BG_HEX = "#0f0f23";
   const DEFAULT_BG_OPACITY = 85;
   const DEFAULT_LANG = "en";
   const DEFAULT_TEXT_MODE = "white";
+  const TOGGLE_DEBOUNCE_MS = 300;
 
   const I18N = {
     es: {
@@ -72,22 +76,22 @@
   const titleEl = document.getElementById("todo-title");
   const toggleBtn = document.getElementById("todo-toggle-btn");
   const inputRowEl = document.getElementById("todo-input-row");
-  const inputEl = document.getElementById("todo-input");
+  const inputEl = /** @type {HTMLInputElement} */ (document.getElementById("todo-input"));
   const addBtn = document.getElementById("todo-add-btn");
   const listEl = document.getElementById("todo-list");
 
   const settingsBtn = document.getElementById("todo-settings-btn");
   const settingsPanel = document.getElementById("todo-settings-panel");
-  const bgPicker = document.getElementById("todo-bg-color-picker");
-  const bgText = document.getElementById("todo-bg-color-text");
-  const bgOpacityInput = document.getElementById("todo-bg-opacity");
+  const bgPicker = /** @type {HTMLInputElement} */ (document.getElementById("todo-bg-color-picker"));
+  const bgText = /** @type {HTMLInputElement} */ (document.getElementById("todo-bg-color-text"));
+  const bgOpacityInput = /** @type {HTMLInputElement} */ (document.getElementById("todo-bg-opacity"));
   const bgOpacityValueEl = document.getElementById("todo-bg-opacity-value");
-  const accentPicker = document.getElementById("todo-accent-color-picker");
-  const accentText = document.getElementById("todo-accent-color-text");
-  const textModeSelect = document.getElementById("todo-text-mode");
-  const fontSizeInput = document.getElementById("todo-font-size");
+  const accentPicker = /** @type {HTMLInputElement} */ (document.getElementById("todo-accent-color-picker"));
+  const accentText = /** @type {HTMLInputElement} */ (document.getElementById("todo-accent-color-text"));
+  const textModeSelect = /** @type {HTMLSelectElement} */ (document.getElementById("todo-text-mode"));
+  const fontSizeInput = /** @type {HTMLInputElement} */ (document.getElementById("todo-font-size"));
   const fontSizeValueEl = document.getElementById("todo-font-size-value");
-  const languageSelect = document.getElementById("todo-language");
+  const languageSelect = /** @type {HTMLSelectElement} */ (document.getElementById("todo-language"));
 
   let tasks = [];
   let controlsVisible = true;
@@ -126,7 +130,7 @@
 
   const storeGet = (key, fallback) => {
     if (hasSE) {
-      return SE_API.store.get(key).then((value) => (value === undefined || value === null ? fallback : value));
+      return seApi.store.get(key).then((value) => (value === undefined || value === null ? fallback : value));
     }
     try {
       const raw = localStorage.getItem(key);
@@ -137,10 +141,14 @@
   };
 
   const storeSet = (key, value) => {
-    if (hasSE) {
-      SE_API.store.set(key, value);
-    } else {
-      localStorage.setItem(key, JSON.stringify(value));
+    try {
+      if (hasSE) {
+        seApi.store.set(key, value);
+      } else {
+        localStorage.setItem(key, JSON.stringify(value));
+      }
+    } catch (e) {
+      console.error("todo-widget: could not save " + key, e);
     }
   };
 
@@ -148,32 +156,28 @@
 
   const saveTasks = () => storeSet(TASKS_KEY, tasks);
 
-  const makeId = () =>
-    typeof crypto !== "undefined" && crypto.randomUUID
-      ? crypto.randomUUID()
-      : "id-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+  const makeId = () => "id-" + Date.now() + "-" + Math.random().toString(16).slice(2);
 
   const buildTaskElement = (task) => {
     const li = document.createElement("li");
     li.className = "todo-item" + (task.done ? " done" : "");
     li.dataset.id = task.id;
 
-    const label = document.createElement("label");
-    label.className = "todo-check";
-
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.className = "todo-check-input";
-    checkbox.checked = task.done;
-    checkbox.setAttribute("aria-label", I18N[currentLang].checkboxLabel);
-    checkbox.addEventListener("change", () => toggleTask(task.id));
+    // A button instead of <label> + native checkbox: in StreamElements/OBS a single click
+    // can arrive twice, which made the native checkbox check and uncheck itself.
+    const checkBtn = document.createElement("button");
+    checkBtn.type = "button";
+    checkBtn.className = "todo-check";
+    checkBtn.setAttribute("role", "checkbox");
+    checkBtn.setAttribute("aria-checked", String(task.done));
+    checkBtn.setAttribute("aria-label", I18N[currentLang].checkboxLabel);
+    checkBtn.addEventListener("click", () => toggleTask(task.id));
 
     const box = document.createElement("span");
     box.className = "todo-check-box";
     box.innerHTML = CHECK_ICON_SVG;
 
-    label.appendChild(checkbox);
-    label.appendChild(box);
+    checkBtn.appendChild(box);
 
     const span = document.createElement("span");
     span.className = "todo-text";
@@ -186,7 +190,7 @@
     deleteBtn.innerHTML = TRASH_ICON_SVG;
     deleteBtn.addEventListener("click", () => deleteTask(task.id));
 
-    li.appendChild(label);
+    li.appendChild(checkBtn);
     li.appendChild(span);
     li.appendChild(deleteBtn);
     return li;
@@ -217,13 +221,27 @@
     }
   };
 
+  const lastToggleAt = {};
+
   const toggleTask = (id) => {
     const task = tasks.find((t) => t.id === id);
     if (!task) return;
-    task.done = !task.done;
-    saveTasks();
+    // Ignore the second half of a duplicated click on the same task.
+    const now = Date.now();
+    if (now - (lastToggleAt[id] || 0) < TOGGLE_DEBOUNCE_MS) return;
+    lastToggleAt[id] = now;
+
+    // Replace instead of mutating: objects loaded from SE_API.store may not be writable.
+    const done = !task.done;
+    tasks = tasks.map((t) => (t.id === id ? { ...t, done } : t));
+
     const li = listEl.querySelector(`[data-id="${id}"]`);
-    if (li) li.classList.toggle("done", task.done);
+    if (li) {
+      li.classList.toggle("done", done);
+      const checkBtn = li.querySelector(".todo-check");
+      if (checkBtn) checkBtn.setAttribute("aria-checked", String(done));
+    }
+    saveTasks();
   };
 
   const deleteTask = (id) => {
@@ -280,7 +298,7 @@
     widgetEl.style.background = hexToRgba(currentBgHex, currentBgOpacity / 100);
     widgetEl.style.setProperty("--todo-bg", currentBgHex);
     syncColorInputs(bgPicker, bgText, currentBgHex);
-    bgOpacityInput.value = currentBgOpacity;
+    bgOpacityInput.value = String(currentBgOpacity);
     bgOpacityValueEl.textContent = currentBgOpacity + "%";
   };
 
@@ -296,7 +314,7 @@
 
   const applyFontSize = (px) => {
     widgetEl.style.setProperty("--todo-font-size", px + "px");
-    fontSizeInput.value = px;
+    fontSizeInput.value = String(px);
     fontSizeValueEl.textContent = px + "px";
   };
 
@@ -305,15 +323,15 @@
     currentLang = I18N[lang] ? lang : DEFAULT_LANG;
 
     widgetEl.querySelectorAll("[data-i18n]").forEach((el) => {
-      const key = el.dataset.i18n;
+      const key = el.getAttribute("data-i18n");
       if (dict[key]) el.textContent = dict[key];
     });
     widgetEl.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
-      const key = el.dataset.i18nPlaceholder;
-      if (dict[key]) el.placeholder = dict[key];
+      const key = el.getAttribute("data-i18n-placeholder");
+      if (dict[key]) el.setAttribute("placeholder", dict[key]);
     });
     widgetEl.querySelectorAll("[data-i18n-aria-label]").forEach((el) => {
-      const key = el.dataset.i18nAriaLabel;
+      const key = el.getAttribute("data-i18n-aria-label");
       if (dict[key]) el.setAttribute("aria-label", dict[key]);
     });
 
@@ -378,7 +396,9 @@
     applyFields(fieldData);
     Promise.all([loadTasks(), storeGet(CONTROLS_KEY, true), storeGet(SETTINGS_KEY, null)]).then(
       ([loadedTasks, loadedVisible, loadedSettings]) => {
-        tasks = loadedTasks;
+        tasks = (Array.isArray(loadedTasks) ? loadedTasks : [])
+          .filter((t) => t && t.id !== undefined)
+          .map((t) => ({ id: String(t.id), text: String(t.text), done: !!t.done }));
         controlsVisible = loadedVisible;
         applyControlsVisibility();
 
@@ -420,22 +440,22 @@
   toggleBtn.addEventListener("click", toggleControls);
   settingsBtn.addEventListener("click", toggleSettingsPanel);
 
-  bgPicker.addEventListener("input", (e) => setBackgroundColor(e.target.value));
+  bgPicker.addEventListener("input", () => setBackgroundColor(bgPicker.value));
   bgText.addEventListener("change", () => handleHexTextChange(bgText, currentBgHex, setBackgroundColor));
-  bgOpacityInput.addEventListener("input", (e) => setBackgroundOpacity(Number(e.target.value)));
+  bgOpacityInput.addEventListener("input", () => setBackgroundOpacity(Number(bgOpacityInput.value)));
 
-  accentPicker.addEventListener("input", (e) => setAccentColor(e.target.value));
+  accentPicker.addEventListener("input", () => setAccentColor(accentPicker.value));
   accentText.addEventListener("change", () =>
     handleHexTextChange(accentText, settings.accentColor || accentPicker.value, setAccentColor)
   );
 
-  textModeSelect.addEventListener("change", (e) => setTextMode(e.target.value));
-  fontSizeInput.addEventListener("input", (e) => setFontSize(Number(e.target.value)));
-  languageSelect.addEventListener("change", (e) => setLanguage(e.target.value));
+  textModeSelect.addEventListener("change", () => setTextMode(textModeSelect.value));
+  fontSizeInput.addEventListener("input", () => setFontSize(Number(fontSizeInput.value)));
+  languageSelect.addEventListener("change", () => setLanguage(languageSelect.value));
 
   if (hasSE) {
     window.addEventListener("onWidgetLoad", (obj) => {
-      init(obj.detail.fieldData);
+      init(/** @type {CustomEvent} */ (obj).detail.fieldData);
     });
   } else {
     init(null);
